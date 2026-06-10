@@ -1,8 +1,47 @@
+/*
+    SISTEMA DE SENHAS EM C
+
+    Este servidor funciona de duas formas ao mesmo tempo:
+
+    1. Modo terminal:
+       - Um cliente em C pode se conectar via socket TCP.
+       - Envia "Solicitar senha|NOME_DA_MAQUINA".
+       - O servidor responde com uma senha, exemplo: A001.
+
+    2. Modo web:
+       - Um navegador pode acessar:
+         http://IP_DO_SERVIDOR:8080/
+         http://IP_DO_SERVIDOR:8080/cliente
+         http://IP_DO_SERVIDOR:8080/painel
+
+       - O servidor entrega páginas HTML diretamente.
+       - O botão da página cliente solicita uma senha.
+       - O painel consulta a última senha chamada.
+
+    O front web é independente do cliente terminal.
+    Se remover o navegador/front, o cliente de terminal continua funcionando.
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
+/*
+    Esta parte separa o código de Windows e Linux.
+
+    No Windows, sockets usam Winsock:
+    - winsock2.h
+    - ws2tcpip.h
+    - WSAStartup()
+    - closesocket()
+
+    No Linux, sockets usam:
+    - unistd.h
+    - arpa/inet.h
+    - sys/socket.h
+    - close()
+*/
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -23,20 +62,59 @@
     #define SOCKET_ERROR -1
 #endif
 
+/*
+    PORTA:
+    Porta onde o servidor vai escutar.
+    O navegador acessa usando essa porta:
+    http://IP_DO_SERVIDOR:8080/cliente
+
+    MAX_CLIENTES:
+    Quantidade de conexões aguardando na fila do listen.
+
+    TAM_BUFFER:
+    Tamanho máximo da mensagem recebida do cliente/navegador.
+*/
 #define PORTA 8080
 #define MAX_CLIENTES 10
 #define TAM_BUFFER 8192
 
+/*
+    contador:
+    Controla a sequência das senhas:
+    A001, A002, A003...
+
+    ultima_senha:
+    Guarda a última senha gerada.
+    O painel usa isso para saber qual senha mostrar.
+
+    ultima_maquina:
+    Guarda o nome da máquina/setor que pediu a última senha.
+*/
 int contador = 1;
 char ultima_senha[20] = "Nenhuma";
 char ultima_maquina[256] = "Nenhuma";
 
+/*
+    Mutex para proteger o contador e os dados globais.
+
+    Como o servidor usa threads, mais de um cliente pode pedir senha ao mesmo tempo.
+    Sem mutex, duas threads poderiam tentar alterar o contador juntas e causar erro.
+
+    No Windows usamos CRITICAL_SECTION.
+    No Linux usamos pthread_mutex_t.
+*/
 #ifdef _WIN32
     CRITICAL_SECTION mutex_contador;
 #else
     pthread_mutex_t mutex_contador = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
+/*
+    Inicializa os sockets.
+
+    No Windows, é obrigatório chamar WSAStartup antes de usar socket().
+    No Linux, não precisa fazer nada.
+*/
 void inicializar_sockets() {
 #ifdef _WIN32
     WSADATA wsa;
@@ -48,12 +126,24 @@ void inicializar_sockets() {
 #endif
 }
 
+/*
+    Finaliza os sockets.
+
+    No Windows, chama WSACleanup.
+    No Linux, não precisa fazer nada.
+*/
 void finalizar_sockets() {
 #ifdef _WIN32
     WSACleanup();
 #endif
 }
 
+/*
+    Bloqueia o mutex.
+
+    Isso impede que duas threads alterem contador, ultima_senha
+    ou ultima_maquina ao mesmo tempo.
+*/
 void bloquear_mutex() {
 #ifdef _WIN32
     EnterCriticalSection(&mutex_contador);
@@ -62,6 +152,12 @@ void bloquear_mutex() {
 #endif
 }
 
+/*
+    Libera o mutex.
+
+    Depois que a thread terminou de mexer nos dados compartilhados,
+    outras threads podem acessar.
+*/
 void liberar_mutex() {
 #ifdef _WIN32
     LeaveCriticalSection(&mutex_contador);
@@ -70,10 +166,29 @@ void liberar_mutex() {
 #endif
 }
 
+/*
+    Envia texto puro pelo socket.
+
+    send() é usado tanto no Windows quanto no Linux.
+*/
 void enviar_texto(socket_t cliente_socket, const char *texto) {
     send(cliente_socket, texto, (int)strlen(texto), 0);
 }
 
+/*
+    Gera uma nova senha.
+
+    Exemplo:
+    contador = 1  -> A001
+    contador = 2  -> A002
+    contador = 10 -> A010
+
+    Também atualiza:
+    - ultima_senha
+    - ultima_maquina
+
+    Essa função usa mutex porque altera dados globais.
+*/
 void gerar_senha(const char *nome_maquina, char *senha_saida, int tamanho_senha) {
     bloquear_mutex();
 
@@ -88,6 +203,16 @@ void gerar_senha(const char *nome_maquina, char *senha_saida, int tamanho_senha)
     printf("Servidor: Senha gerada: %s para %s\n", senha_saida, nome_maquina);
 }
 
+/*
+    Decodifica texto vindo de URL.
+
+    No navegador, espaços e acentos podem vir codificados.
+    Exemplo:
+    "Recepcao+1" vira "Recepcao 1"
+    "Jo%C3%A3o" vira "João", dependendo da codificação recebida.
+
+    Isso é usado para ler o nome da máquina/setor enviado pelo front web.
+*/
 void url_decode(char *destino, const char *origem, int tamanho_destino) {
     int i = 0;
     int j = 0;
@@ -118,6 +243,21 @@ void url_decode(char *destino, const char *origem, int tamanho_destino) {
     destino[j] = '\0';
 }
 
+/*
+    Extrai o método HTTP da requisição.
+
+    Exemplo de requisição:
+    GET /cliente HTTP/1.1
+
+    Método extraído:
+    GET
+
+    Outro exemplo:
+    POST /api/solicitar HTTP/1.1
+
+    Método extraído:
+    POST
+*/
 void obter_metodo_http(const char *requisicao, char *metodo, int tamanho_metodo) {
     const char *fim = strchr(requisicao, ' ');
 
@@ -136,6 +276,21 @@ void obter_metodo_http(const char *requisicao, char *metodo, int tamanho_metodo)
     metodo[tamanho] = '\0';
 }
 
+/*
+    Extrai o caminho HTTP da requisição.
+
+    Exemplo:
+    GET /cliente HTTP/1.1
+
+    Caminho extraído:
+    /cliente
+
+    Exemplo:
+    GET /painel HTTP/1.1
+
+    Caminho:
+    /painel
+*/
 void obter_caminho_http(const char *requisicao, char *caminho, int tamanho_caminho) {
     const char *inicio = strchr(requisicao, ' ');
 
@@ -163,6 +318,21 @@ void obter_caminho_http(const char *requisicao, char *caminho, int tamanho_camin
     caminho[tamanho] = '\0';
 }
 
+/*
+    Extrai o corpo de uma requisição HTTP.
+
+    Em requisições POST, os dados podem vir depois de uma linha vazia.
+
+    Exemplo:
+    POST /api/solicitar HTTP/1.1
+    Host: localhost
+    Content-Type: application/x-www-form-urlencoded
+
+    maquina=Recepcao+1
+
+    Corpo extraído:
+    maquina=Recepcao+1
+*/
 void obter_corpo_http(const char *requisicao, char *corpo, int tamanho_corpo) {
     const char *inicio = strstr(requisicao, "\r\n\r\n");
 
@@ -176,6 +346,17 @@ void obter_corpo_http(const char *requisicao, char *corpo, int tamanho_corpo) {
     snprintf(corpo, tamanho_corpo, "%s", inicio);
 }
 
+/*
+    Procura o parâmetro "maquina=" dentro de um texto.
+
+    Usado na requisição POST do front web.
+
+    Exemplo:
+    maquina=Recepcao+1
+
+    Resultado:
+    Recepcao 1
+*/
 void obter_parametro_maquina(const char *texto, char *maquina, int tamanho_maquina) {
     char *inicio = strstr(texto, "maquina=");
 
@@ -210,6 +391,23 @@ void obter_parametro_maquina(const char *texto, char *maquina, int tamanho_maqui
     }
 }
 
+/*
+    Envia uma resposta HTTP completa.
+
+    Uma resposta HTTP precisa ter:
+    - linha de status
+    - cabeçalhos
+    - linha em branco
+    - conteúdo
+
+    Exemplo:
+    HTTP/1.1 200 OK
+    Content-Type: text/html; charset=utf-8
+    Content-Length: 123
+    Connection: close
+
+    <html>...</html>
+*/
 void enviar_resposta_http(socket_t cliente_socket, const char *status, const char *tipo, const char *conteudo) {
     char cabecalho[512];
 
@@ -230,10 +428,16 @@ void enviar_resposta_http(socket_t cliente_socket, const char *status, const cha
     enviar_texto(cliente_socket, conteudo);
 }
 
+/*
+    Atalho para enviar resposta HTTP 200 OK.
+*/
 void enviar_200(socket_t cliente_socket, const char *tipo, const char *conteudo) {
     enviar_resposta_http(cliente_socket, "200 OK", tipo, conteudo);
 }
 
+/*
+    Envia página de erro 404.
+*/
 void enviar_404(socket_t cliente_socket) {
     const char *conteudo =
         "<!DOCTYPE html>"
@@ -250,12 +454,25 @@ void enviar_404(socket_t cliente_socket) {
     enviar_resposta_http(cliente_socket, "404 Not Found", "text/html", conteudo);
 }
 
+/*
+    Envia erro 405.
+
+    Usado quando alguém tenta acessar /api/solicitar com GET.
+    Por segurança, o servidor só aceita POST para gerar senha via web.
+*/
 void enviar_405(socket_t cliente_socket) {
     const char *conteudo = "Metodo nao permitido.";
 
     enviar_resposta_http(cliente_socket, "405 Method Not Allowed", "text/plain", conteudo);
 }
 
+/*
+    Página inicial web.
+
+    Mostra links para:
+    - cliente
+    - painel
+*/
 void pagina_inicial(socket_t cliente_socket) {
     const char *html =
         "<!DOCTYPE html>"
@@ -284,6 +501,19 @@ void pagina_inicial(socket_t cliente_socket) {
     enviar_200(cliente_socket, "text/html", html);
 }
 
+/*
+    Página cliente web.
+
+    Essa página tem:
+    - campo para nome da máquina/setor
+    - botão para solicitar senha
+    - área para mostrar a senha recebida
+
+    O JavaScript usa fetch() com método POST para chamar:
+    /api/solicitar
+
+    Isso evita gerar senha ao simplesmente abrir uma URL no navegador.
+*/
 void pagina_cliente(socket_t cliente_socket) {
     const char *html =
         "<!DOCTYPE html>"
@@ -345,6 +575,19 @@ void pagina_cliente(socket_t cliente_socket) {
     enviar_200(cliente_socket, "text/html", html);
 }
 
+/*
+    Página painel web.
+
+    O painel:
+    - mostra a última senha
+    - mostra a máquina/setor
+    - consulta /api/ultima a cada 2 segundos
+    - pode falar a senha usando SpeechSynthesis do navegador
+
+    A voz precisa ser ativada com clique no botão,
+    porque navegadores normalmente bloqueiam áudio automático
+    sem interação do usuário.
+*/
 void pagina_painel(socket_t cliente_socket) {
     const char *html =
         "<!DOCTYPE html>"
@@ -424,6 +667,30 @@ void pagina_painel(socket_t cliente_socket) {
     enviar_200(cliente_socket, "text/html", html);
 }
 
+/*
+    Trata requisições vindas do navegador.
+
+    Rotas existentes:
+
+    GET /
+        Página inicial.
+
+    GET /cliente
+        Página do cliente web.
+
+    GET /painel
+        Página do painel.
+
+    GET /api/ultima
+        Retorna a última senha no formato:
+        A001|Recepcao 1
+
+    POST /api/solicitar
+        Gera uma nova senha.
+
+    Qualquer outra rota:
+        404.
+*/
 void tratar_requisicao_http(socket_t cliente_socket, char *buffer) {
     char metodo[16];
     char caminho[512];
@@ -462,10 +729,10 @@ void tratar_requisicao_http(socket_t cliente_socket, char *buffer) {
     }
 
     /*
-        Proteção importante:
         /api/solicitar só aceita POST.
 
-        Abrir no navegador por GET não gera senha.
+        Isso evita que alguém gere senha só abrindo uma URL
+        ou recarregando uma página por engano.
     */
     if (strcmp(caminho, "/api/solicitar") == 0) {
         if (strcmp(metodo, "POST") != 0) {
@@ -496,6 +763,14 @@ void tratar_requisicao_http(socket_t cliente_socket, char *buffer) {
     enviar_404(cliente_socket);
 }
 
+/*
+    Exibe no terminal mensagens desconhecidas sem gerar senha.
+
+    Isso é importante porque, antes, qualquer coisa que não fosse HTTP
+    acabava sendo tratada como pedido de senha.
+
+    Agora o servidor ignora mensagens desconhecidas.
+*/
 void imprimir_mensagem_ignorada(const char *buffer) {
     printf("Mensagem desconhecida ignorada: ");
 
@@ -512,6 +787,21 @@ void imprimir_mensagem_ignorada(const char *buffer) {
     printf("\n");
 }
 
+/*
+    Trata mensagens vindas do cliente terminal.
+
+    Mensagens válidas:
+
+    ULTIMA
+        Retorna:
+        A001|Recepcao 1
+
+    Solicitar senha
+        Gera senha com máquina desconhecida.
+
+    Solicitar senha|NOME_DA_MAQUINA
+        Gera senha usando o nome enviado.
+*/
 void tratar_requisicao_terminal(socket_t cliente_socket, char *buffer) {
     if (strcmp(buffer, "ULTIMA") == 0) {
         char resposta[300];
@@ -563,6 +853,17 @@ void tratar_requisicao_terminal(socket_t cliente_socket, char *buffer) {
     CLOSESOCKET(cliente_socket);
 }
 
+/*
+    Trata cada conexão recebida.
+
+    O servidor lê a primeira mensagem recebida.
+
+    Se começar com:
+    GET  -> é navegador
+    POST -> é navegador
+
+    Caso contrário, trata como cliente terminal.
+*/
 void tratar_cliente(socket_t cliente_socket) {
     char buffer[TAM_BUFFER] = {0};
 
@@ -588,6 +889,11 @@ void tratar_cliente(socket_t cliente_socket) {
     tratar_requisicao_terminal(cliente_socket, buffer);
 }
 
+/*
+    Função da thread no Windows.
+
+    Cada cliente conectado roda em uma thread separada.
+*/
 #ifdef _WIN32
 DWORD WINAPI thread_cliente(LPVOID arg) {
     socket_t cliente_socket = *(socket_t *)arg;
@@ -598,6 +904,10 @@ DWORD WINAPI thread_cliente(LPVOID arg) {
     return 0;
 }
 #else
+
+/*
+    Função da thread no Linux.
+*/
 void *thread_cliente(void *arg) {
     socket_t cliente_socket = *(socket_t *)arg;
     free(arg);
@@ -608,6 +918,18 @@ void *thread_cliente(void *arg) {
 }
 #endif
 
+/*
+    Função principal.
+
+    Passos:
+    1. Inicializa sockets.
+    2. Cria socket do servidor.
+    3. Configura reutilização da porta.
+    4. Associa o socket à porta 8080.
+    5. Começa a escutar conexões.
+    6. Aceita clientes em loop.
+    7. Cria uma thread para cada conexão.
+*/
 int main() {
     socket_t servidor_fd;
     struct sockaddr_in endereco;
@@ -619,6 +941,13 @@ int main() {
     InitializeCriticalSection(&mutex_contador);
 #endif
 
+    /*
+        Cria socket TCP IPv4.
+
+        AF_INET     -> IPv4
+        SOCK_STREAM -> TCP
+        0           -> protocolo padrão
+    */
     servidor_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (servidor_fd == INVALID_SOCKET) {
@@ -627,6 +956,9 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    /*
+        Permite reutilizar a porta rapidamente depois de fechar o servidor.
+    */
 #ifdef _WIN32
     setsockopt(
         servidor_fd,
@@ -645,10 +977,22 @@ int main() {
     );
 #endif
 
+    /*
+        Define o endereço do servidor.
+
+        INADDR_ANY significa:
+        aceitar conexões vindas de qualquer interface de rede:
+        - localhost
+        - rede local
+        - Tailscale
+    */
     endereco.sin_family = AF_INET;
     endereco.sin_addr.s_addr = INADDR_ANY;
     endereco.sin_port = htons(PORTA);
 
+    /*
+        Associa o socket à porta.
+    */
     if (bind(servidor_fd, (struct sockaddr *)&endereco, sizeof(endereco)) == SOCKET_ERROR) {
         printf("Erro no bind.\n");
         CLOSESOCKET(servidor_fd);
@@ -656,6 +1000,9 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    /*
+        Coloca o servidor em modo de escuta.
+    */
     if (listen(servidor_fd, MAX_CLIENTES) == SOCKET_ERROR) {
         printf("Erro no listen.\n");
         CLOSESOCKET(servidor_fd);
@@ -671,6 +1018,12 @@ int main() {
     printf("  http://localhost:%d/painel\n", PORTA);
     printf("Aguardando conexoes...\n");
 
+    /*
+        Loop principal do servidor.
+
+        accept() espera uma conexão.
+        Quando alguém conecta, criamos uma thread para atender essa conexão.
+    */
     while (1) {
         struct sockaddr_in endereco_cliente;
         socklen_t addrlen = sizeof(endereco_cliente);
@@ -686,6 +1039,9 @@ int main() {
             continue;
         }
 
+        /*
+            Aloca memória para passar o socket para a thread.
+        */
         socket_t *cliente_ptr = malloc(sizeof(socket_t));
 
         if (cliente_ptr == NULL) {
@@ -697,6 +1053,9 @@ int main() {
         *cliente_ptr = novo_socket;
 
 #ifdef _WIN32
+        /*
+            Cria thread no Windows.
+        */
         HANDLE thread = CreateThread(
             NULL,
             0,
@@ -711,9 +1070,16 @@ int main() {
             CLOSESOCKET(novo_socket);
             free(cliente_ptr);
         } else {
+            /*
+                Fecha o handle da thread.
+                A thread continua rodando.
+            */
             CloseHandle(thread);
         }
 #else
+        /*
+            Cria thread no Linux.
+        */
         pthread_t thread;
 
         if (pthread_create(&thread, NULL, thread_cliente, cliente_ptr) != 0) {
@@ -721,11 +1087,18 @@ int main() {
             CLOSESOCKET(novo_socket);
             free(cliente_ptr);
         } else {
+            /*
+                A thread se limpa sozinha ao terminar.
+            */
             pthread_detach(thread);
         }
 #endif
     }
 
+    /*
+        Na prática, o programa nunca chega aqui,
+        porque o while acima é infinito.
+    */
     CLOSESOCKET(servidor_fd);
 
 #ifdef _WIN32
