@@ -223,9 +223,11 @@ int main(int argc, char *argv[]) {
 
         Exemplo Tailscale:
         100.x.x.x
+
+        
     */
     if (argc < 2) {
-        ip_servidor = "192.168.137.1";
+        ip_servidor = "100.108.102.30";
         printf("Nenhum IP informado. Usando IP padrao: %s\n", ip_servidor);
     } else {
         ip_servidor = argv[1];
